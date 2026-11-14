@@ -1,0 +1,35 @@
+{
+  "name": "appsocom/appsocom",
+  "description": "PHP server SDK for Appsocom Live video calls: join tokens, rooms, moderation and webhook verification",
+  "type": "library",
+  "keywords": [
+    "appsocom",
+    "video",
+    "calls",
+    "webrtc",
+    "sfu",
+    "cloudflare"
+  ],
+  "homepage": "https://live.appsocom.com",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Appsotech Limited",
+      "homepage": "https://appsocom.com"
+    }
+  ],
+  "support": {
+    "docs": "https://docs.appsocom.dev/server-sdks",
+    "source": "https://github.com/appsotechltd/appsocom-php"
+  },
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "SfuKit\\": "src/"
+    }
+  }
+}
