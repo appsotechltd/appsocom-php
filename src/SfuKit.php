@@ -13,7 +13,7 @@ namespace SfuKit;
  */
 class SfuKit
 {
-    public const VERSION = '0.6.0';
+    public const VERSION = '0.6.3';
     public readonly string $url;
 
     /**
@@ -254,6 +254,107 @@ class SfuKit
     public function lessonReport(string $lessonId): array
     {
         return $this->request('GET', '/lessons/' . self::id($lessonId) . '/report');
+    }
+
+    // ---------- AI Presenter (product demos and walkthroughs) ----------
+
+    /**
+     * Start an AI Presenter from an approved presentation kit.
+     * $options: planId (or lesson), lead ('ai'|'human'), name, voice, avatar, reportEmails, webhookUrl, maxMinutes.
+     * Returns ['presentationId', 'lessonId', 'agentId', 'roomId', …]. Stop it with stopLesson().
+     */
+    public function startPresenter(string $roomId, array $options): array
+    {
+        return $this->request('POST', '/rooms/' . self::id($roomId) . '/presenter', $options);
+    }
+
+    /** Change who leads: 'ai' or 'human'. */
+    public function setPresenterLead(string $roomId, string $presentationId, string $lead): void
+    {
+        $this->controlLesson($roomId, $presentationId, ['action' => 'lead', 'lead' => $lead]);
+    }
+
+    /**
+     * The live demo's cloud browser: 'take', 'give', 'close', or an op such as
+     * ['op' => 'click-at', 'x' => 0.4, 'y' => 0.2], ['op' => 'scroll', 'direction' => 'down'].
+     */
+    public function presenterBrowser(string $roomId, string $presentationId, string|array $action): void
+    {
+        $body = is_array($action) ? ['action' => 'browser', 'browser' => 'op', 'op' => $action] : ['action' => 'browser', 'browser' => $action];
+        $this->controlLesson($roomId, $presentationId, $body);
+    }
+
+    /** Presentations that ended, newest first (optionally of one kit). */
+    public function listPresentationReports(?string $planId = null): array
+    {
+        return $this->request('GET', '/presentation-reports' . ($planId !== null ? '?planId=' . rawurlencode($planId) : ''));
+    }
+
+    /** One presentation: summary, recommendations, questions and suggestions. */
+    public function getPresentationReport(string $reportId): array
+    {
+        return $this->request('GET', '/presentation-reports/' . self::id($reportId));
+    }
+
+    /** Mark a suggestion (its index in the report) 'new', 'reviewed', 'accepted' or 'dismissed'. */
+    public function reviewSuggestion(string $reportId, int $index, string $status): array
+    {
+        return $this->request('PUT', '/presentation-reports/' . self::id($reportId) . '/suggestions/' . $index, ['status' => $status]);
+    }
+
+    // ---- self-running presentations: a link the AI Presenter presents on its own, privately to each visitor
+
+    /** A link from an approved kit: ['planId' => …, 'title', 'reportEmails', 'askDetails', 'maxMinutes', 'perDay', 'maxConcurrent', …]. */
+    public function createPresentationLink(array $options): array
+    {
+        return $this->request('POST', '/presentation-links', $options);
+    }
+
+    public function listPresentationLinks(): array
+    {
+        return $this->request('GET', '/presentation-links');
+    }
+
+    public function getPresentationLink(string $linkId): array
+    {
+        return $this->request('GET', '/presentation-links/' . self::id($linkId));
+    }
+
+    /** Fields you leave out stay; ['active' => false] closes the link. */
+    public function updatePresentationLink(string $linkId, array $patch): array
+    {
+        return $this->request('PATCH', '/presentation-links/' . self::id($linkId), $patch);
+    }
+
+    public function deletePresentationLink(string $linkId): void
+    {
+        $this->request('DELETE', '/presentation-links/' . self::id($linkId));
+    }
+
+    /**
+     * A visitor opened the link: ['name' => …, 'email' => …, 'company' => …, 'phone' => …].
+     * Returns ['sessionId', 'roomId', 'token', 'expiresAt']; the presenter starts when they join.
+     */
+    public function startPresentationSession(string $linkId, array $visitor): array
+    {
+        return $this->request('POST', '/presentation-links/' . self::id($linkId) . '/sessions', ['visitor' => $visitor]);
+    }
+
+    /** Visitors and their leads, newest first (optionally of one link). */
+    public function listPresentationSessions(?string $linkId = null): array
+    {
+        return $this->request('GET', '/presentation-sessions' . ($linkId !== null ? '?linkId=' . rawurlencode($linkId) : ''));
+    }
+
+    public function getPresentationSession(string $sessionId): array
+    {
+        return $this->request('GET', '/presentation-sessions/' . self::id($sessionId));
+    }
+
+    /** A host token for a colleague to step into a visitor's presentation. */
+    public function joinPresentationSession(string $sessionId, string $name, ?string $userId = null): array
+    {
+        return $this->request('POST', '/presentation-sessions/' . self::id($sessionId) . '/join', array_filter(['name' => $name, 'userId' => $userId], fn ($v) => $v !== null));
     }
 
     public function learnerProgress(string $learnerId): array
