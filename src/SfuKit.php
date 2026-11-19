@@ -13,7 +13,7 @@ namespace SfuKit;
  */
 class SfuKit
 {
-    public const VERSION = '0.6.3';
+    public const VERSION = '0.7.0';
     public readonly string $url;
 
     /**
@@ -215,6 +215,13 @@ class SfuKit
     /** The file's bytes (WAV or WebM). */
     public function downloadRecording(string $roomId, string $recordingId, string $file): string
     {
+        // The kit's own patterns for the parts of a recording download path.
+        if (!preg_match('/^[A-Za-z0-9-]{1,64}$/D', $recordingId)) {
+            throw new SfuKitError(400, "invalid recording id \"$recordingId\" (letters, numbers, -, max 64)");
+        }
+        if (!preg_match('/^[A-Za-z0-9._@-]{1,128}$/D', $file) || $file === '.' || $file === '..') {
+            throw new SfuKitError(400, "invalid recording file \"$file\" (letters, numbers, . _ @ -, max 128, not . or ..)");
+        }
         return $this->request('GET', '/rooms/' . self::id($roomId) . '/recordings/' . rawurlencode($recordingId) . '/' . rawurlencode($file), null, true);
     }
 
@@ -489,6 +496,56 @@ class SfuKit
         return $this->request('POST', '/timetable-runs/' . rawurlencode($key) . '/skip');
     }
 
+    // ---------- AI assistant ----------
+
+    /**
+     * Tell the assistant about your app; replaces the whole config. Keys: name, instructions,
+     * tools ([name, description, parameters, risk, pinned, assistantAllowed]), toolsUrl,
+     * appMap ([label, path, description, aliases]), defaultTier, roleTiers, knowledge, retentionDays.
+     */
+    public function setAssistantConfig(array $config): array
+    {
+        if (isset($config['roleTiers']) && is_array($config['roleTiers'])) {
+            $config['roleTiers'] = (object) $config['roleTiers'];
+        }
+        if (isset($config['tools']) && is_array($config['tools'])) {
+            foreach ($config['tools'] as $i => $tool) {
+                if (is_array($tool) && isset($tool['parameters']) && is_array($tool['parameters'])) {
+                    $config['tools'][$i]['parameters'] = self::schemaObjects($tool['parameters']);
+                }
+            }
+        }
+        return $this->request('PUT', '/assistant/config', (object) $config)['config'];
+    }
+
+    public function getAssistantConfig(): array
+    {
+        return $this->request('GET', '/assistant/config')['config'];
+    }
+
+    /**
+     * A token for one signed-in person to chat with the assistant. Options: name, role, conversationId,
+     * tools (names), paths, tier, retentionDays, monthlyMessages (this person's messages per month),
+     * metadata (string values, passed back with every tool call), context (what your app knows about
+     * this person that the assistant should always have, at most 3,000 characters), reportUsage (add tier,
+     * units, cost and tokens to the done event, for a backend that relays answers),
+     * ttlSeconds (default 3600, at most 43200).
+     * @return array{token:string, conversationId:string, expiresAt:int}
+     */
+    public function createAssistantToken(string $userId, array $options = []): array
+    {
+        if (isset($options['metadata'])) {
+            $options['metadata'] = (object) $options['metadata'];
+        }
+        return $this->request('POST', '/assistant/tokens', ['userId' => $userId] + array_filter($options, static fn ($v) => $v !== null));
+    }
+
+    /** Forget one person's conversation (its memory and transcript). */
+    public function deleteAssistantConversation(string $userId, string $conversationId): void
+    {
+        $this->request('DELETE', '/assistant/conversations/' . self::id($userId) . '/' . self::id($conversationId));
+    }
+
     public function health(): array
     {
         return $this->request('GET', '/health');
@@ -536,10 +593,25 @@ class SfuKit
 
     private static function id(string $value): string
     {
-        if (!preg_match(Tokens::ID, $value)) {
+        // "." and ".." would be resolved as dot segments, sending the request to a different route.
+        if (!preg_match(Tokens::ID, $value) || $value === '.' || $value === '..') {
             throw new SfuKitError(400, "invalid id \"$value\" (letters, numbers, . _ : @ -, max 128)");
         }
         return rawurlencode($value);
+    }
+
+    /** A JSON Schema with its empty maps ("properties": {}) kept as objects. */
+    private static function schemaObjects(array $schema): object
+    {
+        foreach (['properties', 'patternProperties', '$defs', 'definitions'] as $k) {
+            if (isset($schema[$k]) && is_array($schema[$k])) {
+                $schema[$k] = (object) array_map(static fn ($v) => is_array($v) ? self::schemaObjects($v) : $v, $schema[$k]);
+            }
+        }
+        if (isset($schema['items']) && is_array($schema['items']) && ($schema['items'] === [] || !array_is_list($schema['items']))) {
+            $schema['items'] = self::schemaObjects($schema['items']);
+        }
+        return (object) $schema;
     }
 
     /** Send metadata and permission maps as JSON objects even when empty. */

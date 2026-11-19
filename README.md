@@ -34,7 +34,41 @@ if ($event === null) { http_response_code(401); exit; }
 http_response_code(204);
 ```
 
-All methods: `createToken`, `getRoom`, `listParticipants`, `updateRoom`, `setRoomMetadata`, `lockRoom`, `closeRoom`, `updateParticipant`, `setPermissions`, `setRole`, `setParticipantMetadata`, `setTrackPermissions`, `removeParticipant`, `unban`, `mute`, `admit`, `postChat`, `lowerHands`, `getAttendance`, `getAttendanceCsv`, `clearAttendance`, `startBreakouts`, `endBreakouts`, `moveToGroup`, `health`, `request()`. Standalone: `Tokens::sign`, `Webhooks::verify`, `Webhooks::sign`.
+## AI assistant
+
+Tell the assistant about your app once, mint a token for each signed-in person, and answer its tool calls at your `toolsUrl`:
+
+```php
+use SfuKit\AssistantToolError;
+use SfuKit\AssistantTools;
+
+$kit->setAssistantConfig([
+    'name' => 'Ada',
+    'toolsUrl' => 'https://app.example/assistant-tools',
+    'tools' => [['name' => 'list_students', 'description' => 'Students in a class', 'parameters' => ['type' => 'object', 'properties' => ['cls' => ['type' => 'string']]]]],
+    'appMap' => [['label' => 'Fees', 'path' => '/fees', 'aliases' => ['bursary']]],
+]);
+$tok = $kit->createAssistantToken($user->id, ['name' => $user->name, 'role' => $user->role, 'metadata' => ['school' => $user->schoolId]]);
+// give $tok['token'] to the browser (@appsocom/react <AssistantPanel>)
+
+// assistant-tools.php
+$tools = new AssistantTools(getenv('APPSOCOM_WEBHOOK_SECRET'), [
+    'list_students' => function (array $args, array $call) use ($db) { // runs as the person who asked
+        if ($call['role'] !== 'teacher') {
+            throw new AssistantToolError('Only teachers can list students.'); // the model sees this message
+        }
+        return $db->students($call['metadata']['school'], $args['cls']);
+    },
+]);
+[$status, $body] = $tools->handle(file_get_contents('php://input'), $_SERVER['HTTP_X_SFUKIT_SIGNATURE'] ?? null);
+http_response_code($status);
+header('Content-Type: application/json');
+echo $body;
+```
+
+`handle()` refuses bad or stale signatures with 401, answers `{"result": ...}` (`"done"` when a tool returns null) or `{"error": ...}`, and hides any exception other than `AssistantToolError` as "The tool failed." (pass `onError:` to see it). Also: `getAssistantConfig`, `deleteAssistantConversation($userId, $conversationId)`, `AssistantTools::verify`.
+
+All methods: `createToken`, `getRoom`, `listParticipants`, `updateRoom`, `setRoomMetadata`, `lockRoom`, `closeRoom`, `updateParticipant`, `setPermissions`, `setRole`, `setParticipantMetadata`, `setTrackPermissions`, `removeParticipant`, `unban`, `mute`, `admit`, `postChat`, `lowerHands`, `getAttendance`, `getAttendanceCsv`, `clearAttendance`, `startBreakouts`, `endBreakouts`, `moveToGroup`, `setAssistantConfig`, `getAssistantConfig`, `createAssistantToken`, `deleteAssistantConversation`, `health`, `request()`. Standalone: `Tokens::sign`, `Webhooks::verify`, `Webhooks::sign`, `AssistantTools`.
 
 Self-hosting your own deployment instead? Point `url` at it and pass its admin key; the optional `third argument (JWT secret)` signs tokens locally without an HTTP call.
 
