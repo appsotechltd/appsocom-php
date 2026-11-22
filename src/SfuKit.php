@@ -13,7 +13,7 @@ namespace SfuKit;
  */
 class SfuKit
 {
-    public const VERSION = '0.7.0';
+    public const VERSION = '0.8.0';
     public readonly string $url;
 
     /**
@@ -528,7 +528,8 @@ class SfuKit
      * tools (names), paths, tier, retentionDays, monthlyMessages (this person's messages per month),
      * metadata (string values, passed back with every tool call), context (what your app knows about
      * this person that the assistant should always have, at most 3,000 characters), reportUsage (add tier,
-     * units, cost and tokens to the done event, for a backend that relays answers),
+     * units, cost and tokens to the done event, for a backend that relays answers), knowledge (a knowledge
+     * base collection to answer from, for an app that keeps each customer's knowledge apart),
      * ttlSeconds (default 3600, at most 43200).
      * @return array{token:string, conversationId:string, expiresAt:int}
      */
@@ -546,6 +547,290 @@ class SfuKit
         $this->request('DELETE', '/assistant/conversations/' . self::id($userId) . '/' . self::id($conversationId));
     }
 
+    // ---------- AI Tasks (/ai/*; called AI Text in code) ----------
+
+    /** Seconds AI Tasks calls may take (they write whole answers); longer than the client's timeout. */
+    public const AI_TIMEOUT_SECONDS = 300;
+
+    /**
+     * One Claude call with your own prompt: `prompt`, or `system` and `messages`. Keys: prompt, system,
+     * messages ([['role' => 'user'|'assistant', 'content' => …]]), json (true for any JSON object, or a
+     * JSON Schema array for an answer that keeps to it), tier ('standard', 'smart', 'best'), maxTokens
+     * (default 4000, at most 32000), user (your id for the person this is for: per-person monthly
+     * allowance, audit), label (your own label, shown in usage and audit).
+     * @return array{task:string, tier:string, text:string, json?:mixed, error?:string, stopReason:?string, usage:array}
+     */
+    public function aiComplete(array $request): array
+    {
+        return $this->call('POST', '/ai/complete', Json::encode(array_merge(self::aiBody($request), ['stream' => false])), 'application/json', max($this->timeoutSeconds, self::AI_TIMEOUT_SECONDS));
+    }
+
+    /**
+     * A ready-made task: 'write', 'mark', 'questions', 'summary', 'moderate' or 'extract' (see the AI Tasks
+     * docs for each input). Options: tier, maxTokens, user, label.
+     */
+    public function aiTask(string $task, array $input, array $options = []): array
+    {
+        return $this->call('POST', '/ai/complete', Json::encode(array_merge(self::aiBody($options), ['task' => $task, 'input' => (object) $input])), 'application/json', max($this->timeoutSeconds, self::AI_TIMEOUT_SECONDS));
+    }
+
+    /**
+     * Your own prompt, streamed: `$onText` is called with each piece of text as it is written. Takes the keys
+     * of aiComplete except json. Returns the call's usage (model, tokens, cost, credits), or null if the
+     * stream ended without it. Throws SfuKitError when the kit refuses the call (429 at the daily limit) or
+     * the stream fails. Return false from `$onText` to stop reading.
+     * @param callable(string): (void|bool) $onText
+     */
+    public function aiStream(array $request, callable $onText): ?array
+    {
+        unset($request['json']);
+        $headers = $this->headers('application/json');
+        $buffer = '';
+        $errorBody = '';
+        $usage = null;
+        $failure = null;
+        $finished = false;
+        [$status, $err] = $this->stream(
+            'POST',
+            $this->url . '/ai/complete',
+            $headers,
+            Json::encode(array_merge(self::aiBody($request), ['stream' => true])),
+            max($this->timeoutSeconds, self::AI_TIMEOUT_SECONDS),
+            function (int $status, string $chunk) use (&$buffer, &$errorBody, &$usage, &$failure, &$finished, $onText): bool {
+                if ($status < 200 || $status >= 300) {
+                    $errorBody .= $chunk;
+                    return true;
+                }
+                if ($finished) {
+                    return true;
+                }
+                $buffer .= $chunk;
+                try {
+                    while (($end = strpos($buffer, "\n\n")) !== false) {
+                        $block = substr($buffer, 0, $end);
+                        $buffer = substr($buffer, $end + 2);
+                        $event = preg_match('/^event: (.*)$/m', $block, $m) ? rtrim($m[1], "\r") : null;
+                        $data = preg_match('/^data: (.*)$/m', $block, $m) ? rtrim($m[1], "\r") : null;
+                        if ($event === null || $data === null) {
+                            continue;
+                        }
+                        $d = Json::decode($data);
+                        if ($event === 'text' && !empty($d['text'])) {
+                            if ($onText($d['text']) === false) {
+                                $finished = true;
+                                return false;
+                            }
+                        } elseif ($event === 'error') {
+                            $failure = new SfuKitError(502, 'sfukit POST /ai/complete: ' . ($d['error'] ?? 'stream failed'), $d);
+                            return false;
+                        } elseif ($event === 'done') {
+                            $usage = $d['usage'] ?? null;
+                            $finished = true;
+                            return true;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    $failure = $e;
+                    return false;
+                }
+                return true;
+            }
+        );
+        if ($failure !== null) {
+            throw $failure;
+        }
+        if ($status !== 0 && ($status < 200 || $status >= 300)) {
+            throw self::httpError('POST', '/ai/complete', $status, $errorBody);
+        }
+        if ($finished || $err === '') {
+            return $usage;
+        }
+        throw new SfuKitError(0, "sfukit POST /ai/complete: $err");
+    }
+
+    /** @return array{settings:array, dailyCapUsd:float} */
+    public function getAiSettings(): array
+    {
+        return $this->request('GET', '/ai/settings');
+    }
+
+    /** Replace AI Tasks' settings. Keys: dailyBudgetUsd, userMonthlyUsd, tiers, defaultTier, audit. */
+    public function setAiSettings(array $settings): array
+    {
+        return $this->request('PUT', '/ai/settings', (object) $settings);
+    }
+
+    /** Spending (today against the cap, per day) and calls by task and model over `$days` (1-90). */
+    public function getAiUsage(int $days = 7): array
+    {
+        return $this->request('GET', '/ai/usage?days=' . $days);
+    }
+
+    /**
+     * One UTC day's calls (never their text), optionally one person's.
+     * @return array{day:string, events:array, truncated:bool}
+     */
+    public function getAiAudit(?string $day = null, ?string $user = null): array
+    {
+        $q = array_filter(['day' => $day, 'user' => $user], static fn ($v) => $v !== null && $v !== '');
+        return $this->request('GET', '/ai/audit' . ($q ? '?' . http_build_query($q) : ''));
+    }
+
+    // ---------- Speech (/speech/tts, /speech/stt) ----------
+
+    /**
+     * Speak `$text` (up to 5,000 characters): the audio file's bytes (mp3 unless format 'wav'). Repeats of the
+     * same text come from the cache, free. Options: language (default 'en'; Yoruba 'yo', Hausa 'ha' and Igbo
+     * 'ig' use Spitch or ElevenLabs), voice, provider ('cartesia', 'elevenlabs', 'spitch', 'openai', 'deepgram'),
+     * format ('mp3' or 'wav'), speed (0.5 to 2), model, cache (false: always made fresh, always billed).
+     */
+    public function textToSpeech(string $text, array $options = []): string
+    {
+        return $this->request('POST', '/speech/tts', array_merge(['text' => $text], self::dropNulls($options), ['response' => 'audio']), true);
+    }
+
+    /**
+     * Speak `$text` and get a signed link that plays without your key until it expires. Takes the options of
+     * textToSpeech except cache, and expiresIn (60 seconds to 7 days, default 3600).
+     * @return array{url:string, expiresAt:int, cached:bool, characters:int, provider:string, voice:string, format:string}
+     */
+    public function textToSpeechUrl(string $text, array $options = []): array
+    {
+        return $this->request('POST', '/speech/tts', array_merge(['text' => $text], self::dropNulls($options), ['response' => 'url']));
+    }
+
+    /**
+     * Transcribe a recording (up to 25 MB, as a string of bytes). Options: contentType (e.g. 'audio/webm',
+     * 'audio/wav', 'audio/mpeg'; default 'application/octet-stream'), language (unset: detected by Deepgram and
+     * ElevenLabs), provider ('deepgram', 'elevenlabs', 'spitch'), model (a Deepgram model, default nova-3),
+     * timeoutSeconds (default 120).
+     * @return array{text:string, language?:string, seconds:int, provider:string, words?:array}
+     */
+    public function speechToText(string $audio, array $options = []): array
+    {
+        $q = array_filter(array_intersect_key($options, ['language' => 1, 'provider' => 1, 'model' => 1]), static fn ($v) => $v !== null && $v !== '');
+        return $this->call(
+            'POST',
+            '/speech/stt' . ($q ? '?' . http_build_query($q) : ''),
+            $audio,
+            (string) ($options['contentType'] ?? 'application/octet-stream'),
+            (int) ($options['timeoutSeconds'] ?? 120)
+        );
+    }
+
+    /** Speech spending per day (US dollars) and today's cap: ['today' => […], 'days' => […]]. */
+    public function getSpeechUsage(): array
+    {
+        return $this->request('GET', '/speech/usage');
+    }
+
+    /** The project's own daily speech cap in US dollars (null = the server's default). */
+    public function setSpeechDailyBudget(?float $dailyBudgetUsd): array
+    {
+        return $this->request('PUT', '/speech/config', ['dailyBudgetUsd' => $dailyBudgetUsd]);
+    }
+
+    // ---------- Videos (video on demand on R2) ----------
+
+    /** Seconds a video upload may take (a whole file, or one part of it); longer than the client's timeout. */
+    public const UPLOAD_TIMEOUT_SECONDS = 600;
+
+    /**
+     * An upload link for one video: give `uploadUrl` to the browser (it PUTs the file straight to it, or its
+     * parts when `protocol` is 'parts'), or send a file from your server with uploadVideoFile. Keys:
+     * maxDurationSeconds (required: the longest the video may be; longer ones are refused when converted),
+     * name, meta (up to 10 string pairs of your own), uploadLength (the file's size in bytes; required over
+     * 95 MB, up to 5 GB).
+     * @return array{videoId:string, uploadUrl:string, protocol:string, partSize?:int, parts?:int, expiresAt:string}
+     */
+    public function createVideoUpload(array $request): array
+    {
+        if (!isset($request['maxDurationSeconds'])) {
+            throw new SfuKitError(400, 'maxDurationSeconds is required');
+        }
+        return $this->request('POST', '/videos/uploads', self::withMeta(self::dropNulls($request)));
+    }
+
+    /**
+     * Send a file from your server to an upload link (both protocols): one PUT, or each part in turn and then
+     * the finishing POST. `$file` is a string of bytes, or a readable stream (read in parts for big files).
+     * Returns the video.
+     * @param string|resource $file
+     */
+    public function uploadVideoFile(array $upload, mixed $file): array
+    {
+        $stream = is_resource($file) ? $file : null;
+        if ($stream === null && !is_string($file)) {
+            throw new SfuKitError(400, 'file must be a string of bytes or a readable stream');
+        }
+        $url = (string) ($upload['uploadUrl'] ?? '');
+        $timeout = max($this->timeoutSeconds, self::UPLOAD_TIMEOUT_SECONDS);
+        if (($upload['protocol'] ?? '') === 'put') {
+            return $this->upload('PUT', $url, $stream !== null ? (string) stream_get_contents($stream) : $file, null, $timeout);
+        }
+        $size = (int) ($upload['partSize'] ?? 50 * 1024 * 1024);
+        if ($size < 1) {
+            throw new SfuKitError(400, 'invalid partSize');
+        }
+        $sep = str_contains($url, '?') ? '&' : '?';
+        $parts = [];
+        for ($n = 1, $at = 0;; $n++, $at += $size) {
+            $chunk = $stream !== null ? self::readPart($stream, $size) : (string) substr($file, $at, $size);
+            if ($chunk === '') {
+                break;
+            }
+            $parts[] = $this->upload('PUT', "$url{$sep}part=$n", $chunk, null, $timeout);
+        }
+        return $this->upload('POST', "$url{$sep}complete", Json::encode(['parts' => $parts]), 'application/json', $timeout);
+    }
+
+    /** Bring in a video from a public https link (moving an existing library over). Options: name, meta, maxDurationSeconds. */
+    public function copyVideo(string $url, array $options = []): array
+    {
+        return $this->request('POST', '/videos/copy', ['url' => $url] + self::withMeta(self::dropNulls($options)));
+    }
+
+    /**
+     * Your videos, newest first: ['videos' => […], 'next' => …]. Options: after (the `next` of the last page), limit.
+     */
+    public function listVideos(array $options = []): array
+    {
+        $q = array_filter(array_intersect_key($options, ['after' => 1, 'limit' => 1]), static fn ($v) => $v !== null && $v !== '');
+        return $this->request('GET', '/videos' . ($q ? '?' . http_build_query($q) : ''));
+    }
+
+    public function getVideo(string $videoId): array
+    {
+        return $this->request('GET', '/videos/' . self::id($videoId));
+    }
+
+    /** Rename (name), or replace your meta (meta). */
+    public function updateVideo(string $videoId, array $update): array
+    {
+        return $this->request('PATCH', '/videos/' . self::id($videoId), (object) self::withMeta($update));
+    }
+
+    /** Delete the video and its files for good. */
+    public function deleteVideo(string $videoId): void
+    {
+        $this->request('DELETE', '/videos/' . self::id($videoId));
+    }
+
+    /**
+     * Signed links for one viewer. Make one per viewing; they expire. Options: expiresInSeconds (5 minutes to 24 hours).
+     * @return array{videoId:string, hls:string, iframe:string, thumbnail:string, expiresAt:string}
+     */
+    public function videoPlayback(string $videoId, array $options = []): array
+    {
+        return $this->request('POST', '/videos/' . self::id($videoId) . '/playback', (object) self::dropNulls($options));
+    }
+
+    /** Bytes kept, this month's meters and your caps. */
+    public function getVideoUsage(): array
+    {
+        return $this->request('GET', '/videos/usage');
+    }
+
     public function health(): array
     {
         return $this->request('GET', '/health');
@@ -556,39 +841,157 @@ class SfuKit
     /** Call any admin endpoint (for routes this SDK doesn't wrap yet). */
     public function request(string $method, string $path, mixed $body = null, bool $raw = false): mixed
     {
-        $headers = ['Authorization: Bearer ' . $this->adminKey, 'User-Agent: sfukit-php/' . self::VERSION];
-        $ch = curl_init($this->url . $path);
-        $opts = [
-            CURLOPT_CUSTOMREQUEST => $method,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeoutSeconds,
-        ];
-        if ($body !== null) {
-            $opts[CURLOPT_POSTFIELDS] = Json::encode($body);
-            $headers[] = 'Content-Type: application/json';
-        }
-        $opts[CURLOPT_HTTPHEADER] = $headers;
-        curl_setopt_array($ch, $opts);
-        $text = curl_exec($ch);
-        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        $err = curl_error($ch);
-        curl_close($ch);
+        return $this->call($method, $path, $body === null ? null : Json::encode($body), 'application/json', $this->timeoutSeconds, $raw);
+    }
+
+    /** One admin call with an already encoded body (`$contentType` says what it is). */
+    private function call(string $method, string $path, ?string $payload, string $contentType, int $timeoutSeconds, bool $raw = false): mixed
+    {
+        [$status, $text, $err] = $this->exchange($method, $this->url . $path, $this->headers($payload === null ? null : $contentType), $payload, $timeoutSeconds);
         if ($text === false) {
             throw new SfuKitError(0, "sfukit $method $path: $err");
         }
         if ($status < 200 || $status >= 300) {
-            try {
-                $parsed = Json::decode($text);
-            } catch (\JsonException) {
-                $parsed = $text;
-            }
-            $msg = is_array($parsed) && isset($parsed['error']) ? $parsed['error'] : $text;
-            throw new SfuKitError($status, "sfukit $method $path: $status $msg", $parsed);
+            throw self::httpError($method, $path, $status, $text);
         }
         if ($raw) {
             return $text;
         }
         return $text === '' ? null : Json::decode($text);
+    }
+
+    /** Send bytes to an upload link the kit gave. The link carries its own token, so the admin key is not sent. */
+    private function upload(string $method, string $url, string $payload, ?string $contentType, int $timeoutSeconds): mixed
+    {
+        if (!in_array(strtolower((string) parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true)) {
+            throw new SfuKitError(400, "invalid upload link \"$url\"");
+        }
+        $headers = ['User-Agent: sfukit-php/' . self::VERSION];
+        if ($contentType !== null) {
+            $headers[] = 'Content-Type: ' . $contentType;
+        }
+        [$status, $text, $err] = $this->exchange($method, $url, $headers, $payload, $timeoutSeconds);
+        if ($text === false) {
+            throw new SfuKitError(0, "sfukit video upload: $err");
+        }
+        if ($status < 200 || $status >= 300) {
+            throw self::httpError('video upload', '', $status, $text);
+        }
+        return $text === '' ? null : Json::decode($text);
+    }
+
+    /** @return list<string> */
+    private function headers(?string $contentType): array
+    {
+        $headers = ['Authorization: Bearer ' . $this->adminKey, 'User-Agent: sfukit-php/' . self::VERSION];
+        if ($contentType !== null) {
+            $headers[] = 'Content-Type: ' . $contentType;
+        }
+        return $headers;
+    }
+
+    /**
+     * The one place a request leaves the SDK (tests replace it).
+     * @param list<string> $headers
+     * @return array{0:int, 1:string|false, 2:string} status, body (false if nothing came back), curl's error
+     */
+    protected function exchange(string $method, string $url, array $headers, ?string $payload, int $timeoutSeconds): array
+    {
+        $ch = curl_init($url);
+        $opts = [
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => $timeoutSeconds,
+            CURLOPT_HTTPHEADER => $headers,
+        ];
+        if ($payload !== null) {
+            $opts[CURLOPT_POSTFIELDS] = $payload;
+        }
+        curl_setopt_array($ch, $opts);
+        $text = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+        return [$status, is_string($text) ? $text : false, $err];
+    }
+
+    /**
+     * Like exchange(), for an answer read as it arrives: `$onChunk(status, chunk)` gets each piece of the body
+     * (return false to stop reading). Tests replace it.
+     * @param list<string> $headers
+     * @param callable(int, string): bool $onChunk
+     * @return array{0:int, 1:string} status, curl's error ('' if none)
+     */
+    protected function stream(string $method, string $url, array $headers, ?string $payload, int $timeoutSeconds, callable $onChunk): array
+    {
+        $ch = curl_init($url);
+        $opts = [
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_TIMEOUT => $timeoutSeconds,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use ($onChunk): int {
+                return $onChunk((int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE), $chunk) === false ? 0 : strlen($chunk);
+            },
+        ];
+        if ($payload !== null) {
+            $opts[CURLOPT_POSTFIELDS] = $payload;
+        }
+        curl_setopt_array($ch, $opts);
+        curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+        return [$status, $err];
+    }
+
+    private static function httpError(string $method, string $path, int $status, string $text): SfuKitError
+    {
+        try {
+            $parsed = Json::decode($text);
+        } catch (\JsonException) {
+            $parsed = $text;
+        }
+        $msg = is_array($parsed) && isset($parsed['error']) ? $parsed['error'] : $text;
+        return new SfuKitError($status, trim("sfukit $method $path") . ": $status $msg", $parsed);
+    }
+
+    /** Options without the ones left null. */
+    private static function dropNulls(array $options): array
+    {
+        return array_filter($options, static fn ($v) => $v !== null);
+    }
+
+    /** A request body for /ai/complete: nulls left out, a JSON Schema kept as nested objects. */
+    private static function aiBody(array $request): array
+    {
+        $body = self::dropNulls($request);
+        if (isset($body['json']) && is_array($body['json'])) {
+            $body['json'] = self::schemaObjects($body['json']);
+        }
+        return $body;
+    }
+
+    /** Send `meta` as a JSON object even when empty. */
+    private static function withMeta(array $body): array
+    {
+        if (isset($body['meta']) && is_array($body['meta'])) {
+            $body['meta'] = (object) $body['meta'];
+        }
+        return $body;
+    }
+
+    /** @param resource $stream */
+    private static function readPart($stream, int $size): string
+    {
+        $buf = '';
+        while (strlen($buf) < $size && !feof($stream)) {
+            $piece = fread($stream, $size - strlen($buf));
+            if ($piece === false || $piece === '') {
+                break;
+            }
+            $buf .= $piece;
+        }
+        return $buf;
     }
 
     private static function id(string $value): string

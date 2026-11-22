@@ -68,7 +68,31 @@ echo $body;
 
 `handle()` refuses bad or stale signatures with 401, answers `{"result": ...}` (`"done"` when a tool returns null) or `{"error": ...}`, and hides any exception other than `AssistantToolError` as "The tool failed." (pass `onError:` to see it). Also: `getAssistantConfig`, `deleteAssistantConversation($userId, $conversationId)`, `AssistantTools::verify`.
 
-All methods: `createToken`, `getRoom`, `listParticipants`, `updateRoom`, `setRoomMetadata`, `lockRoom`, `closeRoom`, `updateParticipant`, `setPermissions`, `setRole`, `setParticipantMetadata`, `setTrackPermissions`, `removeParticipant`, `unban`, `mute`, `admit`, `postChat`, `lowerHands`, `getAttendance`, `getAttendanceCsv`, `clearAttendance`, `startBreakouts`, `endBreakouts`, `moveToGroup`, `setAssistantConfig`, `getAssistantConfig`, `createAssistantToken`, `deleteAssistantConversation`, `health`, `request()`. Standalone: `Tokens::sign`, `Webhooks::verify`, `Webhooks::sign`, `AssistantTools`.
+## AI Tasks, Speech and Videos
+
+```php
+// AI Tasks: one Claude call from your server (a ready-made task, or your own prompt)
+$marked = $kit->aiTask('mark', ['question' => $q, 'answer' => $a, 'rubric' => $rubric, 'maxScore' => 10], ['user' => $studentId]);
+$marked['json']['score']; $marked['usage']['credits'];
+$draft = $kit->aiComplete(['prompt' => 'Write a two-line welcome for new parents.', 'tier' => 'standard']);
+$usage = $kit->aiStream(['prompt' => 'Tell a short story.'], function (string $piece): void {
+    echo $piece; flush();
+}); // returns the call's usage (model, tokens, cost, credits)
+
+// Speech
+$audio = $kit->textToSpeech('Well done!', ['language' => 'en']);                      // mp3 bytes
+$link = $kit->textToSpeechUrl('Ẹ káàárọ̀', ['language' => 'yo', 'expiresIn' => 3600]); // $link['url'] plays without your key
+$heard = $kit->speechToText($recordingBytes, ['contentType' => 'audio/webm', 'language' => 'ha']); // $heard['text']
+
+// Videos: an upload link for a browser, or send a file from your server
+$upload = $kit->createVideoUpload(['maxDurationSeconds' => 3600, 'name' => 'Lesson 1', 'uploadLength' => $size]);
+$kit->uploadVideoFile($upload, fopen('lesson.mp4', 'rb')); // bytes or a stream
+$links = $kit->videoPlayback($upload['videoId']);          // $links['hls'], ['iframe'], ['thumbnail']
+```
+
+A call the kit refuses (daily limit, no credit) throws `SfuKitError` with the status. Settings and reports: `getAiSettings`, `setAiSettings`, `getAiUsage($days)`, `getAiAudit($day, $user)`, `getSpeechUsage`, `setSpeechDailyBudget`, `getVideoUsage`. Videos: `copyVideo`, `listVideos`, `getVideo`, `updateVideo`, `deleteVideo`. See [AI Tasks](https://docs.appsocom.dev/ai-tasks/), [Speech](https://docs.appsocom.dev/speech/) and [Videos](https://docs.appsocom.dev/videos/).
+
+All methods: `createToken`, `getRoom`, `listParticipants`, `updateRoom`, `setRoomMetadata`, `lockRoom`, `closeRoom`, `updateParticipant`, `setPermissions`, `setRole`, `setParticipantMetadata`, `setTrackPermissions`, `removeParticipant`, `unban`, `mute`, `admit`, `postChat`, `lowerHands`, `getAttendance`, `getAttendanceCsv`, `clearAttendance`, `startBreakouts`, `endBreakouts`, `moveToGroup`, `setAssistantConfig`, `getAssistantConfig`, `createAssistantToken`, `deleteAssistantConversation`, `aiComplete`, `aiTask`, `aiStream`, `getAiSettings`, `setAiSettings`, `getAiUsage`, `getAiAudit`, `textToSpeech`, `textToSpeechUrl`, `speechToText`, `getSpeechUsage`, `setSpeechDailyBudget`, `createVideoUpload`, `uploadVideoFile`, `copyVideo`, `listVideos`, `getVideo`, `updateVideo`, `deleteVideo`, `videoPlayback`, `getVideoUsage`, `health`, `request()`. Standalone: `Tokens::sign`, `Webhooks::verify`, `Webhooks::sign`, `AssistantTools`.
 
 Self-hosting your own deployment instead? Point `url` at it and pass its admin key; the optional `third argument (JWT secret)` signs tokens locally without an HTTP call.
 

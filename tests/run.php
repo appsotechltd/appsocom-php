@@ -172,5 +172,201 @@ try {
     ok($e->status === 400, 'assistant: dot segment refused');
 }
 
+// ---------- AI Tasks, Speech and Videos ----------
+
+/** A kit that answers from a queue instead of the network, and remembers what was sent. */
+final class FakeKit extends SfuKit
+{
+    /** @var list<array{0:string,1:string,2:array,3:?string,4:int}> */
+    public array $seen = [];
+    /** @var list<array{0:int,1:string}> */
+    public array $replies = [];
+    /** @var array{0:int,1:list<string>} */
+    public array $streamReply = [200, []];
+
+    protected function exchange(string $method, string $url, array $headers, ?string $payload, int $timeoutSeconds): array
+    {
+        $this->seen[] = [$method, $url, $headers, $payload, $timeoutSeconds];
+        [$status, $body] = array_shift($this->replies) ?? [200, '{}'];
+        return [$status, $body, ''];
+    }
+
+    protected function stream(string $method, string $url, array $headers, ?string $payload, int $timeoutSeconds, callable $onChunk): array
+    {
+        $this->seen[] = [$method, $url, $headers, $payload, $timeoutSeconds];
+        [$status, $chunks] = $this->streamReply;
+        foreach ($chunks as $chunk) {
+            if ($onChunk($status, $chunk) === false) {
+                return [$status, 'Failure writing output to destination'];
+            }
+        }
+        return [$status, ''];
+    }
+
+    /** The last request as "METHOD path" with the host cut off. */
+    public function last(): string
+    {
+        $r = $this->seen[count($this->seen) - 1];
+        return $r[0] . ' ' . substr($r[1], strlen('https://kit.test'));
+    }
+
+    public function lastPayload(): ?string
+    {
+        return $this->seen[count($this->seen) - 1][3];
+    }
+}
+function throwsStatus(callable $fn, int $status, string $contains = ''): bool
+{
+    try {
+        $fn();
+    } catch (SfuKitError $e) {
+        return $e->status === $status && str_contains($e->getMessage(), $contains);
+    }
+    return false;
+}
+
+$fk = new FakeKit('https://kit.test', 'k');
+$fk->replies[] = [200, '{"task":"mark","tier":"smart","text":"{}","json":{"score":3},"usage":{"credits":0.1}}'];
+$r = $fk->aiTask('mark', ['question' => 'q', 'answer' => 'a'], ['user' => 's1', 'tier' => 'smart', 'maxTokens' => 500, 'label' => null]);
+ok($r['json']['score'] === 3 && $fk->last() === 'POST /ai/complete', 'ai: aiTask posts to /ai/complete');
+ok($fk->lastPayload() === '{"user":"s1","tier":"smart","maxTokens":500,"task":"mark","input":{"question":"q","answer":"a"}}', 'ai: aiTask body (nulls left out)');
+ok(in_array('Authorization: Bearer k', $fk->seen[0][2], true) && $fk->seen[0][4] === 300, 'ai: sends the key, waits up to 300 seconds');
+$fk->aiTask('summary', [], ['tier' => 'standard']);
+ok(str_contains($fk->lastPayload(), '"input":{}'), 'ai: an empty input is an object');
+$fk->aiComplete(['prompt' => 'hi', 'system' => 'Be brief', 'json' => true]);
+ok($fk->lastPayload() === '{"prompt":"hi","system":"Be brief","json":true,"stream":false}', 'ai: aiComplete body');
+$fk->aiComplete(['system' => 'Mark it', 'messages' => [['role' => 'user', 'content' => 'x']], 'json' => ['type' => 'object', 'properties' => []], 'stream' => true]);
+ok($fk->lastPayload() === '{"system":"Mark it","messages":[{"role":"user","content":"x"}],"json":{"type":"object","properties":{}},"stream":false}', 'ai: a JSON Schema keeps its empty maps; stream stays false');
+$fk->replies[] = [429, '{"error":"AI Tasks has reached this project\'s daily limit"}'];
+ok(throwsStatus(fn () => $fk->aiComplete(['prompt' => 'x']), 429, 'daily limit'), 'ai: errors carry the status');
+
+$fk->streamReply = [200, ["event: text\ndata: {\"text\":\"Hel\"}\n", "\nevent: text\ndata: {\"text\":\"lo é\"}\n\nevent: do", "ne\ndata: {\"usage\":{\"credits\":0.2}}\n\n"]];
+$text = '';
+$usage = $fk->aiStream(['prompt' => 'x', 'json' => true, 'tier' => 'standard'], function (string $piece) use (&$text): void {
+    $text .= $piece;
+});
+ok($text === 'Hello é' && $usage === ['credits' => 0.2], 'ai: aiStream gives the text pieces, then the usage (events split across chunks)');
+ok($fk->last() === 'POST /ai/complete' && $fk->lastPayload() === '{"prompt":"x","tier":"standard","stream":true}', 'ai: aiStream body (no json)');
+$fk->streamReply = [200, ["event: text\ndata: {\"text\":\"Hel\"}\n\nevent: error\ndata: {\"error\":\"the model stopped\"}\n\n"]];
+ok(throwsStatus(fn () => $fk->aiStream(['prompt' => 'x'], fn (string $p) => null), 502, 'the model stopped'), 'ai: a stream error throws');
+$fk->streamReply = [429, ['{"error":"AI Tasks has reached ', 'this project\'s daily limit"}']];
+ok(throwsStatus(fn () => $fk->aiStream(['prompt' => 'x'], fn (string $p) => null), 429, 'daily limit'), 'ai: a refused stream throws with the status');
+$fk->streamReply = [200, ["event: text\ndata: {\"text\":\"a\"}\n\n", "event: text\ndata: {\"text\":\"b\"}\n\n"]];
+$got = [];
+$stopped = $fk->aiStream(['prompt' => 'x'], function (string $p) use (&$got): bool {
+    $got[] = $p;
+    return false;
+});
+ok($got === ['a'] && $stopped === null, 'ai: returning false from the callback stops reading');
+try {
+    $fk->aiStream(['prompt' => 'x'], function (string $p): void {
+        throw new \LogicException('mine');
+    });
+    ok(false, 'ai: an exception from the callback comes out');
+} catch (\LogicException $e) {
+    ok($e->getMessage() === 'mine', 'ai: an exception from the callback comes out');
+}
+
+$fk = new FakeKit('https://kit.test', 'k');
+$fk->setAiSettings(['dailyBudgetUsd' => 2]);
+$fk->getAiSettings();
+$fk->getAiUsage(30);
+$fk->getAiUsage();
+$fk->getAiAudit('2026-11-20', 'u1');
+$fk->getAiAudit();
+ok(array_map(static fn (array $s) => "$s[0] " . substr($s[1], strlen('https://kit.test')), $fk->seen) === ['PUT /ai/settings', 'GET /ai/settings', 'GET /ai/usage?days=30', 'GET /ai/usage?days=7', 'GET /ai/audit?day=2026-11-20&user=u1', 'GET /ai/audit'], 'ai: settings, usage and audit paths');
+ok($fk->seen[0][3] === '{"dailyBudgetUsd":2}', 'ai: setAiSettings body');
+
+$fk = new FakeKit('https://kit.test', 'k');
+$fk->replies[] = [200, "\x01\x02"];
+ok($fk->textToSpeech('Hi', ['language' => 'yo', 'cache' => null, 'response' => 'url']) === "\x01\x02", 'speech: textToSpeech returns the audio bytes');
+ok($fk->last() === 'POST /speech/tts' && $fk->lastPayload() === '{"text":"Hi","language":"yo","response":"audio"}', 'speech: textToSpeech body');
+$fk->replies[] = [200, '{"url":"https://kit.test/speech/audio/t/x.mp3?exp=1&sig=a","cached":true,"characters":0}'];
+$link = $fk->textToSpeechUrl('Hi', ['expiresIn' => 600, 'format' => 'wav']);
+ok(str_contains($link['url'], '/speech/audio/') && $fk->lastPayload() === '{"text":"Hi","expiresIn":600,"format":"wav","response":"url"}', 'speech: textToSpeechUrl');
+$fk->replies[] = [200, '{"text":"hello","seconds":3,"provider":"deepgram"}'];
+$out = $fk->speechToText("\x00\x01\x02", ['contentType' => 'audio/webm', 'language' => 'en']);
+$req = $fk->seen[count($fk->seen) - 1];
+ok($out['text'] === 'hello' && $req[1] === 'https://kit.test/speech/stt?language=en' && $req[3] === "\x00\x01\x02" && $req[4] === 120, 'speech: speechToText sends the recording as the body');
+ok(in_array('Content-Type: audio/webm', $req[2], true) && in_array('Authorization: Bearer k', $req[2], true), 'speech: speechToText content type and key');
+$fk->speechToText('a');
+ok(in_array('Content-Type: application/octet-stream', $fk->seen[count($fk->seen) - 1][2], true) && $fk->last() === 'POST /speech/stt', 'speech: default content type, no query');
+$fk->replies[] = [429, '{"error":"the project\'s daily speech budget is used up"}'];
+ok(throwsStatus(fn () => $fk->speechToText('quota'), 429, 'daily speech budget'), 'speech: errors carry the status');
+$fk->getSpeechUsage();
+ok($fk->last() === 'GET /speech/usage', 'speech: getSpeechUsage');
+$fk->setSpeechDailyBudget(null);
+ok($fk->last() === 'PUT /speech/config' && $fk->lastPayload() === '{"dailyBudgetUsd":null}', 'speech: setSpeechDailyBudget(null)');
+$fk->setSpeechDailyBudget(2);
+ok($fk->lastPayload() === '{"dailyBudgetUsd":2.0}', 'speech: setSpeechDailyBudget(2)');
+
+$v = str_repeat('a', 32);
+$fk = new FakeKit('https://kit.test', 'k');
+$calls = [];
+$note = function () use ($fk, &$calls): void {
+    $calls[] = $fk->last() . ' ' . ($fk->lastPayload() ?? '-');
+};
+$fk->createVideoUpload(['maxDurationSeconds' => 600, 'name' => 'Lesson 1', 'uploadLength' => 5000, 'meta' => []]);
+$note();
+$fk->copyVideo('https://files.example/a.mp4', ['name' => 'Old']);
+$note();
+$fk->listVideos(['after' => 'abc', 'limit' => 10]);
+$note();
+$fk->listVideos();
+$note();
+$fk->getVideo($v);
+$note();
+$fk->updateVideo($v, ['name' => 'New']);
+$note();
+$fk->videoPlayback($v, ['expiresInSeconds' => 900]);
+$note();
+$fk->videoPlayback($v);
+$note();
+$fk->getVideoUsage();
+$note();
+$fk->deleteVideo($v);
+$note();
+ok($calls === [
+    'POST /videos/uploads {"maxDurationSeconds":600,"name":"Lesson 1","uploadLength":5000,"meta":{}}',
+    'POST /videos/copy {"url":"https://files.example/a.mp4","name":"Old"}',
+    'GET /videos?after=abc&limit=10 -',
+    'GET /videos -',
+    "GET /videos/$v -",
+    "PATCH /videos/$v {\"name\":\"New\"}",
+    "POST /videos/$v/playback {\"expiresInSeconds\":900}",
+    "POST /videos/$v/playback {}",
+    'GET /videos/usage -',
+    "DELETE /videos/$v -",
+], 'videos: the methods call the right routes');
+ok(throwsStatus(fn () => $fk->createVideoUpload(['name' => 'x']), 400, 'maxDurationSeconds'), 'videos: maxDurationSeconds is required');
+foreach (['..', 'a/b', str_repeat('x', 200)] as $bad) {
+    ok(throwsStatus(fn () => $fk->getVideo($bad), 400), 'videos: bad id refused');
+}
+
+$link = 'https://kit.test/videos/upload/p/v?t=x';
+$fk = new FakeKit('https://kit.test', 'k');
+$fk->replies[] = [200, '{"videoId":"v","status":"processing"}'];
+$one = $fk->uploadVideoFile(['videoId' => 'v', 'uploadUrl' => $link, 'protocol' => 'put'], '0123456789');
+$req = $fk->seen[0];
+ok($one['status'] === 'processing' && count($fk->seen) === 1 && $req[0] === 'PUT' && $req[1] === $link && $req[3] === '0123456789', 'upload: one PUT');
+ok(!array_filter($req[2], static fn (string $h) => stripos($h, 'authorization') === 0), 'upload: the link has its own token; the key stays home');
+foreach (['0123456789', 'stream'] as $kind) {
+    $fk = new FakeKit('https://kit.test', 'k');
+    $fk->replies = [[200, '{"partNumber":1,"etag":"e1"}'], [200, '{"partNumber":2,"etag":"e2"}'], [200, '{"partNumber":3,"etag":"e3"}'], [200, '{"videoId":"v","status":"processing"}']];
+    $source = '0123456789';
+    if ($kind === 'stream') {
+        $source = fopen('php://memory', 'r+');
+        fwrite($source, '0123456789');
+        rewind($source);
+    }
+    $fk->uploadVideoFile(['videoId' => 'v', 'uploadUrl' => $link, 'protocol' => 'parts', 'partSize' => 4, 'parts' => 3], $source);
+    ok(array_map(static fn (array $s) => "$s[0] " . substr($s[1], strlen($link)) . ' ' . strlen((string) $s[3]), array_slice($fk->seen, 0, 3)) === ['PUT &part=1 4', 'PUT &part=2 4', 'PUT &part=3 2'], "upload: parts of 4 bytes ($kind)");
+    $done = $fk->seen[3];
+    ok($done[0] === 'POST' && $done[1] === "$link&complete" && $done[3] === '{"parts":[{"partNumber":1,"etag":"e1"},{"partNumber":2,"etag":"e2"},{"partNumber":3,"etag":"e3"}]}' && in_array('Content-Type: application/json', $done[2], true), "upload: finishing POST ($kind)");
+    ok(count($fk->seen) === 4 && !array_filter(array_merge(...array_column($fk->seen, 2)), static fn (string $h) => stripos($h, 'authorization') === 0), "upload: no key sent to the link ($kind)");
+}
+ok(throwsStatus(fn () => $fk->uploadVideoFile(['uploadUrl' => 'file:///etc/passwd', 'protocol' => 'put'], 'x'), 400, 'invalid upload link'), 'upload: links must be http(s)');
+ok(throwsStatus(fn () => $fk->uploadVideoFile(['uploadUrl' => $link, 'protocol' => 'put'], 42), 400), 'upload: file must be bytes or a stream');
+
 echo $fail ? "$fail failed\n" : "all passed\n";
 exit($fail ? 1 : 0);
