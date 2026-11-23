@@ -295,6 +295,25 @@ $fk->replies[] = [429, '{"error":"the project\'s daily speech budget is used up"
 ok(throwsStatus(fn () => $fk->speechToText('quota'), 429, 'daily speech budget'), 'speech: errors carry the status');
 $fk->getSpeechUsage();
 ok($fk->last() === 'GET /speech/usage', 'speech: getSpeechUsage');
+
+$fk->replies[] = [200, '{"languages":[{"code":"fr","name":"French"}]}'];
+ok($fk->getLanguages()[0]['code'] === 'fr' && $fk->last() === 'GET /languages', 'translate: getLanguages');
+$fk->replies[] = [200, '{"from":"en","to":["fr"],"translations":{"fr":"Bonjour"},"text":"Bonjour"}'];
+$t = $fk->translateText('Hello', ['fr', 'de'], ['from' => 'en', 'tier' => 'smart', 'glossary' => ['Appsocom' => 'Appsocom'], 'label' => null]);
+ok($t['text'] === 'Bonjour' && $fk->last() === 'POST /translate/text', 'translate: translateText');
+ok($fk->lastPayload() === '{"text":"Hello","to":["fr","de"],"from":"en","tier":"smart","glossary":{"Appsocom":"Appsocom"}}', 'translate: translateText body (nulls left out)');
+$fk->replies[] = [200, '{"from":"en","transcript":"hello","translations":{"fr":"bonjour"}}'];
+$h = $fk->translateSpeech("\x00\x01", ['fr', 'de'], ['contentType' => 'audio/webm', 'speak' => true, 'voice' => 'v1']);
+$req = $fk->seen[count($fk->seen) - 1];
+ok($h['transcript'] === 'hello' && $req[1] === 'https://kit.test/translate/speech?to=fr%2Cde&voice=v1&speak=true' && $req[3] === "\x00\x01" && $req[4] === 180, 'translate: translateSpeech sends the recording with its options in the query');
+ok(in_array('Content-Type: audio/webm', $req[2], true), 'translate: translateSpeech content type');
+$fk->replies[] = [200, '{"roomId":"room-1","agentId":"a1"}'];
+ok($fk->startInterpreter('room-1', 'fr', ['voiceName' => 'v2'])['agentId'] === 'a1' && $fk->last() === 'POST /rooms/room-1/interpreters' && $fk->lastPayload() === '{"language":"fr","voiceName":"v2"}', 'interpreters: startInterpreter');
+$fk->replies[] = [200, '{"interpreters":[{"agentId":"a1","language":"fr","listeners":2}],"max":3}'];
+ok($fk->listInterpreters('room-1')[0]['listeners'] === 2 && $fk->last() === 'GET /rooms/room-1/interpreters', 'interpreters: listInterpreters');
+$fk->replies[] = [200, '{"stopped":true}'];
+$fk->stopInterpreter('room-1', 'a1');
+ok($fk->last() === 'DELETE /rooms/room-1/interpreters/a1', 'interpreters: stopInterpreter');
 $fk->setSpeechDailyBudget(null);
 ok($fk->last() === 'PUT /speech/config' && $fk->lastPayload() === '{"dailyBudgetUsd":null}', 'speech: setSpeechDailyBudget(null)');
 $fk->setSpeechDailyBudget(2);

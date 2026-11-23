@@ -13,7 +13,7 @@ namespace SfuKit;
  */
 class SfuKit
 {
-    public const VERSION = '0.8.0';
+    public const VERSION = '0.9.0';
     public readonly string $url;
 
     /**
@@ -716,6 +716,78 @@ class SfuKit
             (string) ($options['contentType'] ?? 'application/octet-stream'),
             (int) ($options['timeoutSeconds'] ?? 120)
         );
+    }
+
+    // ---------- Translation (/languages, /translate/*) and AI interpreters ----------
+
+    /**
+     * The languages every AI service takes: [['code', 'name', 'native', 'quality', 'text', 'speechToText',
+     * 'textToSpeech', 'rtl'?], …]. Public; good for a language picker.
+     */
+    public function getLanguages(): array
+    {
+        return $this->request('GET', '/languages')['languages'];
+    }
+
+    /**
+     * Translate up to 20,000 characters into one language or up to 20 ('fr' or ['fr', 'de']). Options: from (the
+     * source language; unset = detected), tier ('standard', 'smart', 'best'), context (what the text is, for tone),
+     * formality ('formal' or 'informal'), glossary (['term' => 'translation']), user and label (AI Tasks audit and
+     * per-person allowance). Billed as AI Tasks credits, within the project's AI Tasks daily cap.
+     * @param string|string[] $to
+     * @return array{from:string, to:string[], translations:array<string,string>, text?:string, tier:string, usage:array}
+     */
+    public function translateText(string $text, string|array $to, array $options = []): array
+    {
+        return $this->request('POST', '/translate/text', self::objects(array_merge(['text' => $text, 'to' => $to], self::dropNulls($options))));
+    }
+
+    /**
+     * Hear a recording (up to 25 MB, as a string of bytes), translate it, and with speak => true voice it (up to 5
+     * languages, as signed links). Options: from, speak, voice, format ('mp3' or 'wav'), tier, context, formality,
+     * user, label, contentType (default 'application/octet-stream'), timeoutSeconds (default 180). Errors carry
+     * 'step': 'speech to text', 'translate' or 'text to speech'.
+     * @param string|string[] $to
+     * @return array{from:?string, transcript:string, seconds:int, to:string[], translations:array<string,string>, text?:string, audio?:array, usage:array}
+     */
+    public function translateSpeech(string $audio, string|array $to, array $options = []): array
+    {
+        $q = ['to' => is_array($to) ? implode(',', $to) : $to];
+        foreach (['from', 'voice', 'format', 'tier', 'context', 'formality', 'user', 'label'] as $k) {
+            if (isset($options[$k]) && $options[$k] !== '') $q[$k] = (string) $options[$k];
+        }
+        if (!empty($options['speak'])) $q['speak'] = 'true';
+        return $this->call(
+            'POST',
+            '/translate/speech?' . http_build_query($q),
+            $audio,
+            (string) ($options['contentType'] ?? 'application/octet-stream'),
+            (int) ($options['timeoutSeconds'] ?? 180)
+        );
+    }
+
+    /**
+     * Add an AI interpreter to a room: it speaks what people say in `$language` ('fr', 'de', …). Only people who
+     * chose that language (room.setInterpretation in the client, or the kits' My language menu) hear it. Up to 3 per
+     * room, one per language. Options: from, name, voiceName, tts ('cartesia' or 'elevenlabs'), metadata. Billed as
+     * AI Agent minutes plus Speech characters, within the project's Speech daily cap.
+     * @return array{roomId:string, agentId:string, participant:array}
+     */
+    public function startInterpreter(string $roomId, string $language, array $options = []): array
+    {
+        return $this->request('POST', '/rooms/' . self::id($roomId) . '/interpreters', self::objects(array_merge(['language' => $language], self::dropNulls($options))));
+    }
+
+    /** The room's AI interpreters: [['agentId', 'language', 'listeners'], …]. */
+    public function listInterpreters(string $roomId): array
+    {
+        return $this->request('GET', '/rooms/' . self::id($roomId) . '/interpreters')['interpreters'];
+    }
+
+    /** Remove an AI interpreter from a room. */
+    public function stopInterpreter(string $roomId, string $agentId): void
+    {
+        $this->request('DELETE', '/rooms/' . self::id($roomId) . '/interpreters/' . self::id($agentId));
     }
 
     /** Speech spending per day (US dollars) and today's cap: ['today' => […], 'days' => […]]. */
